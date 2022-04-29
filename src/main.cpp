@@ -1025,6 +1025,20 @@ private:
 };
 using decision_function = std::function<decision(hero_id, game_state &)>;
 
+template<int I>
+struct team_comp {
+  template<class ...Args>
+  team_comp(Args&&... args) : _decisions{forward<Args>(args)...} {}
+
+  decision operator()(hero_id id, game_state& state) const {
+      return _decisions[min(I, id.value)](id, state);
+  }
+private:
+  array<decision_function, I> _decisions;
+};
+template<class ...Args>
+team_comp(Args&&... args) -> team_comp<sizeof...(Args)>;
+
 // IO
 
 std::istream& operator>>(std::istream& in, position_t& position) {
@@ -1520,6 +1534,12 @@ constexpr auto mage_defender = decide{set_target(away_from_base(DANGER_ZONE)),
                                       attack_around_target{2000},
                                       go_to_target};
 
+const auto default_comp = team_comp{mage_defender, home_defender, point_runner};
+
+auto choose_team_composition(game_state& state) {
+    return default_comp;
+};
+
 int main() {
   position_t base;
   cin >> base;
@@ -1528,20 +1548,14 @@ int main() {
   cin >> heroes_per_player;
   game_state state{base, heroes_per_player};
   cin.ignore();
-  std::vector<decision_function> heroes_actions;
-  heroes_actions.resize(heroes_per_player);
-  heroes_actions[0] = mage_defender;
-  heroes_actions[1] = home_defender;
-  heroes_actions[2] = point_runner;
-
+  
   // game loop
   while (1) {
     cin >> state;
 
-    hero_id current_hero{0};
-    for (const auto &act : heroes_actions) {
+    const auto act = choose_team_composition(state);
+    for (hero_id current_hero{0}; current_hero < heroes_per_player; ++current_hero) {
       cout << act(current_hero, state) << std::endl;
-      current_hero++;
     }
   }
 }
