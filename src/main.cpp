@@ -742,15 +742,16 @@ struct walk {
     position_t position;
 };
 struct shield {
-    constexpr explicit shield(entity_id_t id) : id{id} {}
+  entity_id_t id;
 
-    entity_id_t id;
+  constexpr explicit shield(entity_id_t id) : id{id} {}
 };
 struct control {
-    constexpr explicit control(entity_id_t id, position_t position) : id{id}, position{position} {}
+  constexpr explicit control(entity_id_t id, position_t position)
+      : id{id}, position{position} {}
 
-    entity_id_t id;
-    position_t position;
+  entity_id_t id;
+  position_t position;
 };
 struct wind {
     constexpr explicit wind(position_t position) : position{position} {}
@@ -816,9 +817,11 @@ namespace detail {
         (get<Ts>(tpl).targets_.clear(), ...);
     }
 }
+/// \brief true_type if type T is contained within template container C
 template<class T, class C>
 constexpr static inline bool contains_v = detail::contains<T, C>::value;
 
+/** \brief cache values common to the whole game */
 struct general_cache {
     template<class S>
     struct target_cache {
@@ -852,6 +855,7 @@ struct general_cache {
         }
     }
 
+    /// \brief resets relevant parts of the cache
     void reset() {
         closest_from_opponent_base = nullopt;
         opponent_runner = nullopt;
@@ -859,6 +863,7 @@ struct general_cache {
     }
 };
 
+/** \brief cache values relative to a given hero */
 struct hero_cache {
     hero_cache(hero_id hero) : hero_{hero}, ref{} {}
 
@@ -871,6 +876,8 @@ private:
     entity* ref;
 };
 
+/** \brief contains everything related to the state of the game
+*/
 struct game_state {
 private:
   health health_pool[2];
@@ -881,6 +888,7 @@ private:
 
   general_cache cache_{};
   std::vector<hero_cache> hero_cache_;
+
 
 public:
   game_state(position_t base, int hero_nb)
@@ -1120,7 +1128,9 @@ optional<position_t> target_for_wind(const entity &hero,
     bool endengering_base = dist_from_base <= DANGER_ZONE;
     bool in_range = within(hero, monster, WIND_RANGE);
 
-    if (endengering_base && in_range && !monster.shielded()) {
+    if (!in_range) continue;
+
+    if (endengering_base && !monster.shielded()) {
       return monster.position();
     }
     if (dist_from_base > DANGER_ZONE + WIND_RANGE) {
@@ -1269,7 +1279,8 @@ optional<decision> shadow_opponent_runner(hero_id id, game_state& state) {
         !opponent_runner->controlled() &&
         distance(opponent_runner->position(), this_hero.position()) <
             CONTROL_RANGE) {
-      return control{opponent_runner->id(), state.opponent_base};
+        if (auto spell = state.reserve_mana<control>(opponent_runner->id(), state.opponent_base))
+      return spell;
     }
   }
   return {};
@@ -1321,7 +1332,9 @@ optional<decision> shield_opponent_monster(hero_id id, game_state &state) {
     if (auto monster =
             shield_target(this_hero, state.monsters, state.opponent_base);
         monster.has_value()) {
-      return shield{monster->id()};
+      if (auto spell = state.reserve_mana<shield>(monster->id());
+          spell.has_value())
+        return spell.value();
     }
   }
   return {};
@@ -1332,7 +1345,9 @@ optional<decision> control_monster_to_attack(hero_id id, game_state& state) {
   if (state.my_mana() > 80) {
     if (auto closest = best_controllable_monster(this_hero, state);
         closest.has_value()) {
-      return control{closest->id(), state.opponent_base};
+      if (auto spell =
+              state.reserve_mana<control>(closest->id(), state.opponent_base))
+        return spell;
     }
   }
   return {};
@@ -1362,7 +1377,7 @@ optional<decision> last_resort_control(hero_id id, game_state& state) {
   const auto threat = closest_threat(state.base, state.monsters, DANGER_ZONE * 1.2);
 
   if (threat.has_value() && closest_to(state.base)(threat.value(), this_hero) &&
-      !within(this_hero, threat.value(), WIND_RANGE) &&
+      !within(this_hero, threat.value(), WIND_RANGE) && within(this_hero, threat.value(), CONTROL_RANGE) &&
       within(threat.value(), state.base, WIND_RANGE + 800)) {
     if (auto spell =
             state.reserve_mana<control>(threat->id(), state.opponent_base)) {
