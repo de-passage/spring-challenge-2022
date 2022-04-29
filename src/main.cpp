@@ -684,6 +684,14 @@ template <class T> struct closest_to {
 template<class T>
 closest_to(T&&) -> closest_to<decay_t<T>>;
 
+struct within_t {
+  template <class T, class U>
+  constexpr bool operator()(const T &left, const U &right,
+                            int dist) const noexcept {
+    return distance(get_position(left), get_position(right)) <= dist;
+  }
+} constexpr within;
+
 using health = st::number<int, struct health_tag, streamable>;
 using mana = st::number<int, struct mana_tag, streamable>;
 using hero_id = st::number<int, struct hero_id_tag>;
@@ -842,6 +850,7 @@ struct general_cache {
     entity_ref_opt closest_from_opponent_base;
     entity_ref_opt opponent_runner;
     spell_tuple spell_target_cache;
+    set<entity_id_t> controllers;
 
     /// \returns true if target with given id is not under the influence of 
     /// the same spell
@@ -995,17 +1004,26 @@ public:
     return {};
   }
 
+  bool is_controller(const entity& e) const {
+     return cache_.controllers.count(e.id()) > 0;
+  }
+
   friend std::istream &operator>>(std::istream &in, game_state &state);
+
+private:
+  void compute_controllers() {
+    for (auto &h : heroes) {
+      if (h.controlled()) {
+        for (auto &e : opponents) {
+          if (within(e, h, CONTROL_RANGE)) {
+            cache_.controllers.insert(e.id());
+          }
+        }
+      }
+    }
+  }
 };
 using decision_function = std::function<decision(hero_id, game_state &)>;
-
-struct within_t {
-  template <class T, class U>
-  constexpr bool operator()(const T &left, const U &right,
-                            int dist) const noexcept {
-    return distance(get_position(left), get_position(right)) <= dist;
-  }
-} constexpr within;
 
 // IO
 
@@ -1039,6 +1057,7 @@ std::istream& operator>>(std::istream& in, game_state& state) {
   }
 
   sort(state.monsters_.begin(), state.monsters_.end(), closest_to{state.base});
+  state.compute_controllers();
 
   return in;
 }
@@ -1095,13 +1114,32 @@ constexpr R expand_decision_tree(const tuple<Args...> &tpl,
                                  Ps &&...ps) noexcept {
   return expand_decision_tree<0, R>(tpl, forward<Ps>(ps)...);
 }
+
+template <int I, class R, class... Ps, class... Args>
+constexpr optional<R> try_all(const tuple<Args...> &tpl, Ps &&...ps) noexcept {
+  using ret_t = decltype(get<I>(tpl)(forward<Ps>(ps)...));
+  const auto v = get<I>(tpl)(forward<Ps>(ps)...);
+  if (v.has_value()) {
+    return v;
+  }
+  if constexpr (I < sizeof...(Args) - 1) {
+    return try_all<I + 1, R>(tpl, forward<Ps>(ps)...);
+  } else {
+    return {};
+  }
+}
+
+template <class R, class... Args, class... Ps>
+constexpr optional<R> try_all(const tuple<Args...> &tpl, Ps &&...ps) noexcept {
+  return try_all<0, R>(tpl, forward<Ps>(ps)...);
+}
 } // namespace detail
 
 template <class... Decisions> struct decide {
   template <class... Args>
   constexpr decide(Args &&...args) : decision_trees{forward<Args>(args)...} {}
 
-  constexpr decision operator()(hero_id id, game_state &state) {
+  constexpr decision operator()(hero_id id, game_state &state) const {
     return detail::expand_decision_tree<decision>(decision_trees, id, state);
   }
 
@@ -1111,15 +1149,29 @@ private:
 template<class ...Args>
 decide(Args&&...) -> decide<decay_t<Args>...>;
 
+template <class... Decisions> struct decision_group {
+  template <class... Args>
+  constexpr decision_group(Args &&...args) : decision_trees{forward<Args>(args)...} {}
+
+  constexpr optional<decision> operator()(hero_id id, game_state &state) const {
+    return detail::try_all<decision>(decision_trees, id, state);
+  }
+
+private:
+  tuple<Decisions...> decision_trees;
+};
+template<class ...Args>
+decision_group(Args&&...) -> decision_group<decay_t<Args>...>;
+
 // decision utilities
 optional<position_t> target_for_wind(const entity &hero,
                                      game_state& state) {
 
   struct within_attack_distance {
-      entity target;
-      int range = ATTACK_RANGE;
+    entity target;
+    int range = ATTACK_RANGE;
     constexpr bool operator()(const entity &other) const noexcept {
-      return within(target, other,  range);
+      return within(target, other, range);
     }
   };
 
@@ -1430,12 +1482,31 @@ struct attack_around_target {
   }
 };
 
+optional<decision> shield_ally(hero_id id, game_state &state) {
+  const auto this_hero = state.hero(id);
+  for (auto &h : state.heroes) {
+    for (auto &e : state.opponents) {
+      if (within(h, e, CONTROL_RANGE) && state.is_controller(e) &&
+          !h.shielded() && within(h, this_hero, SHIELD_RANGE)) {
+        auto spell = state.reserve_mana<shield>(h.id());
+        if (spell.has_value()) {
+          return spell;
+        }
+      }
+    }
+  }
+  return {};
+}
+
+constexpr auto last_resort_measures =
+    decision_group{last_resort_control, wind_away_if_needed, shield_ally};
+
 constexpr auto home_defender = decide{
-    set_target(away_from_base(DANGER_ZONE * 1.1)), wind_away_if_needed,
+    set_target(away_from_base(DANGER_ZONE * 1.1)), last_resort_measures,
     shadow_opponent_runner, attack_closest_threat_from_base, go_to_target};
 
 constexpr auto point_runner = decide{set_target(middle_of_the_map),
-                                     wind_away_if_needed,
+                                     last_resort_measures,
                                      shield_opponent_monster,
                                      control_monster_to_attack,
                                      dont_attack_threats_to_opponent,
@@ -1443,15 +1514,11 @@ constexpr auto point_runner = decide{set_target(middle_of_the_map),
                                      go_to_target};
 
 constexpr auto mage_defender = decide{set_target(away_from_base(DANGER_ZONE)),
-                                      last_resort_control,
-                                      wind_away_if_needed,
-                                      shield_self,
+                                      last_resort_measures,
                                       attack_closest_threat_from_base,
                                       go_to_opponent_runner,
                                       attack_around_target{2000},
                                       go_to_target};
-
-
 
 int main() {
   position_t base;
