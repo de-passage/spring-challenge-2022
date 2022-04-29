@@ -9,6 +9,7 @@
 #include <optional>
 #include <numeric>
 #include <tuple>
+#include <set>
 
 using namespace std;
 
@@ -791,13 +792,70 @@ class decision {
 using entity_ref = reference_wrapper<const entity>;
 using entity_ref_opt = optional<entity_ref>;
 
+////////////////////////////////////////
+// GAME STATE 
+////////////////////////////////////////
+
+namespace detail {
+    template<class T, class C>
+    struct contains : false_type {};
+    template<class T, template<class...> class C, class ...Args>
+    struct contains<T, C<Args...>> : bool_constant<disjunction_v<is_same<T, Args>...>> {};
+    struct get_entity_id_t {
+        template<class ...Args>
+        entity_id_t operator()(entity_id_t id, Args&&...) const {
+            return id;
+        }
+        template<class T, class ...Args, enable_if_t<!is_same_v<decay_t<T>, entity_id_t>, int> = 0>
+        entity_id_t operator()(T&&, Args&&... args) const {
+            return operator()(forward<Args>(args)...);
+        }
+    } constexpr get_entity_id;
+    template<class ...Ts>
+    void reset_cache(tuple<Ts...>& tpl) {
+        (get<Ts>(tpl).targets_.clear(), ...);
+    }
+}
+template<class T, class C>
+constexpr static inline bool contains_v = detail::contains<T, C>::value;
+
 struct general_cache {
+    template<class S>
+    struct target_cache {
+        set<entity_id_t> targets_;
+
+        bool target(entity_id_t id) {
+            return targets_.insert(id).second;
+        }
+
+        bool is_targeted(entity_id_t id) {
+            return targets_.count(id) > 0;
+        }
+    };
+    template <class... Ss>
+    using spell_tuple_f = tuple<target_cache<Ss>...>;
+    using spell_tuple = spell_tuple_f<shield, control>;
+
     entity_ref_opt closest_from_opponent_base;
     entity_ref_opt opponent_runner;
+    spell_tuple spell_target_cache;
+
+    /// \returns true if target with given id is not under the influence of 
+    /// the same spell
+    template<class T, class... Args>
+    bool target(Args&&... args) {
+        if constexpr (contains_v<T, spell_tuple>) {
+            return get<T>(spell_target_cache).target(detail::get_entity_id(args...));
+        }
+        else {
+            return true;
+        }
+    }
 
     void reset() {
         closest_from_opponent_base = nullopt;
         opponent_runner = nullopt;
+        detail::reset_cache(spell_target_cache);
     }
 };
 
@@ -893,6 +951,10 @@ public:
             enable_if_t<is_constructible_v<Spell, Args...>, int> = 0>
   optional<Spell> reserve_mana(Args &&...args) noexcept {
     if (my_mana() >= 10) {
+      bool can_target = cache_.target<Spell>(args...);
+      if (!can_target) {
+          return {};
+      }
       mana_pool[static_cast<int>(player::me)] -= 10;
       return Spell{forward<Args>(args)...};
     }
