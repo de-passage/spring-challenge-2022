@@ -588,6 +588,7 @@ struct streamable {
 // Constants
 constexpr int MAX_X = 17630;
 constexpr int MAX_Y = 9000;
+constexpr int SQUARE_SIDE = min(MAX_X, MAX_Y);
 constexpr int DANGER_ZONE = 5000;
 constexpr int WIND_RANGE = 1280;
 constexpr int SHIELD_RANGE = 2200;
@@ -901,10 +902,21 @@ private:
 
 public:
   game_state(position_t base, int hero_nb)
-      : base{base}, opponent_base{position_t{.x = MAX_X, .y = MAX_Y} - base} {
-          for (hero_id i{0}; i < hero_nb; ++i)
-          hero_cache_.emplace_back(i);
-      }
+      : base{base}, opponent_base{position_t{.x = MAX_X, .y = MAX_Y} - base},
+        middle{
+            .x = abs(base.x - opponent_base.x) / 2,
+            .y = abs(base.y - opponent_base.y) / 2,
+        },
+        short_corner{.x = base.x, .y = opponent_base.y},
+        long_corner{.x = opponent_base.x, .y = opponent_base.y},
+        defence_long_side{ .x = opponent_base.x, .y = abs(base.y - (2 * SQUARE_SIDE / 3))},
+        defence_short_side{ .x = abs(base.x - (2 * SQUARE_SIDE / 3)), .y = opponent_base.y } {
+    for (hero_id i{0}; i < hero_nb; ++i) {
+      hero_cache_.emplace_back(i);
+    }
+  }
+  game_state(game_state &&) = delete;
+  game_state(const game_state&) = delete;
   const std::vector<entity> &monsters{monsters_};
   const std::vector<entity> &heroes{heroes_};
   const std::vector<entity> &opponents{opponents_};
@@ -1010,6 +1022,13 @@ public:
 
   friend std::istream &operator>>(std::istream &in, game_state &state);
 
+  // points of interest
+  const position_t middle;
+  const position_t short_corner;
+  const position_t long_corner;
+  const position_t defence_short_side;
+  const position_t defence_long_side;
+
 private:
   void compute_controllers() {
     for (auto &h : heroes) {
@@ -1022,7 +1041,7 @@ private:
       }
     }
   }
-};
+}; // game_state
 using decision_function = std::function<decision(hero_id, game_state &)>;
 
 template<int I>
@@ -1379,17 +1398,17 @@ decision go_to_target(hero_id id, game_state& state) {
 
 constexpr auto away_from_base = [](int dist) {
   return [=](hero_id, game_state &state) {
-    constexpr int s = min(MAX_X, MAX_Y);
-    const position_t t = abs(state.base - position_t{s, s});
-    return travel(state.base, t, dist);
+    return travel(state.base, state.opponent_base, dist);
   };
 };
 constexpr auto middle_of_the_map = [] (hero_id, game_state& state) {
-    auto middle = position_t{
-        .x = abs(state.base.x - state.opponent_base.x) / 2,
-        .y = abs(state.base.y - state.opponent_base.y) / 2,
-    };
-    return middle;
+    return state.middle;
+};
+constexpr auto short_defence_spot = [] (hero_id, game_state& state) {
+    return travel(state.base, state.defence_short_side, BASE_SIGHT_RANGE);
+};
+constexpr auto long_defence_spot = [] (hero_id, game_state& state) {
+    return travel(state.base, state.defence_long_side, BASE_SIGHT_RANGE);
 };
 
 optional<decision> shield_opponent_monster(hero_id id, game_state &state) {
@@ -1515,9 +1534,12 @@ optional<decision> shield_ally(hero_id id, game_state &state) {
 constexpr auto last_resort_measures =
     decision_group{last_resort_control, wind_away_if_needed, shield_ally};
 
-constexpr auto home_defender = decide{
-    set_target(away_from_base(DANGER_ZONE * 1.1)), last_resort_measures,
-    shadow_opponent_runner, attack_closest_threat_from_base, go_to_target};
+constexpr auto home_defender = decide{set_target(short_defence_spot),
+                                      last_resort_measures,
+                                      shadow_opponent_runner,
+                                      attack_closest_threat_from_base,
+                                      attack_around_target{HERO_SIGHT_RANGE},
+                                      go_to_target};
 
 constexpr auto point_runner = decide{set_target(middle_of_the_map),
                                      last_resort_measures,
@@ -1527,11 +1549,11 @@ constexpr auto point_runner = decide{set_target(middle_of_the_map),
                                      attack_closest_threat_from_self,
                                      go_to_target};
 
-constexpr auto mage_defender = decide{set_target(away_from_base(DANGER_ZONE)),
+constexpr auto mage_defender = decide{set_target(long_defence_spot),
                                       last_resort_measures,
                                       attack_closest_threat_from_base,
                                       go_to_opponent_runner,
-                                      attack_around_target{2000},
+                                      attack_around_target{HERO_SIGHT_RANGE},
                                       go_to_target};
 
 const auto default_comp = team_comp{mage_defender, home_defender, point_runner};
