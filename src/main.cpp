@@ -622,6 +622,10 @@ struct position_t {
     friend constexpr position_t abs(position_t in) noexcept {
         return position_t{.x = abs(in.x), .y = abs(in.y)};
     }
+
+    friend constexpr bool operator==(position_t left, position_t right) noexcept { 
+        return left.x == right. x && left.y == right.y;
+    }
 };
 
 constexpr float distance(position_t left, position_t right) {
@@ -873,6 +877,23 @@ struct general_cache {
     }
 };
 
+struct patrol_cache {
+    template<class ...Args> 
+    patrol_cache(Args&&... args) {
+        (path.push_back(args), ...);
+    }
+
+    position_t next_position(position_t cur) {
+        if (within(cur, path[current_path_target], 300)) {
+            current_path_target = (current_path_target + 1) % path.size();
+        }
+        return path[current_path_target];
+    }
+
+    vector<position_t> path;
+    int current_path_target{};
+};
+
 /** \brief cache values relative to a given hero */
 struct hero_cache {
     hero_cache(hero_id hero) : hero_{hero}, ref{} {}
@@ -881,9 +902,22 @@ struct hero_cache {
     void set_ref(entity& e) { ref = addressof(e); }
     position_t target;
 
+    optional<position_t> next_patrol_point() {
+        if (!patrol.has_value()) return {};
+        return patrol->next_position(ref->position());
+    }
+
+    position_t set_patrol(const patrol_cache& p) {
+        if (!patrol.has_value() || patrol->path != p.path) {
+          patrol = p;
+        }
+        return patrol->next_position(ref->position());
+    }
+
 private:
     hero_id hero_;
     entity* ref;
+    optional<patrol_cache> patrol;
 };
 
 /** \brief contains everything related to the state of the game
@@ -898,7 +932,6 @@ private:
 
   general_cache cache_{};
   std::vector<hero_cache> hero_cache_;
-
 
 public:
   game_state(position_t base, int hero_nb)
@@ -1018,6 +1051,14 @@ public:
 
   bool is_controller(const entity& e) const {
      return cache_.controllers.count(e.id()) > 0;
+  }
+
+  position_t set_patrol_path(hero_id id, const patrol_cache& p) {
+      return hero_cache_[id.value].set_patrol(p);
+  }
+
+  position_t patrol(hero_id id, const patrol_cache& p) {
+      return set_patrol_path(id, p);
   }
 
   friend std::istream &operator>>(std::istream &in, game_state &state);
@@ -1379,6 +1420,14 @@ optional<decision> attack_closest_threat_from_base(hero_id, game_state& state) {
   return {};
 }
 
+constexpr auto patrol = [](auto &&...positions) {
+  return [=](hero_id id, game_state &state) -> decision {
+    static const auto patrol_p =
+        patrol_cache{positions(id, state)...};
+    return walk{state.patrol(id, patrol_p)};
+  };
+};
+
 template<class T>
 struct set_target {
     template<class U>
@@ -1539,7 +1588,7 @@ constexpr auto home_defender = decide{set_target(short_defence_spot),
                                       shadow_opponent_runner,
                                       attack_closest_threat_from_base,
                                       attack_around_target{HERO_SIGHT_RANGE},
-                                      go_to_target};
+                                      patrol(short_defence_spot, long_defence_spot)};
 
 constexpr auto point_runner = decide{set_target(middle_of_the_map),
                                      last_resort_measures,
@@ -1549,12 +1598,12 @@ constexpr auto point_runner = decide{set_target(middle_of_the_map),
                                      attack_closest_threat_from_self,
                                      go_to_target};
 
-constexpr auto mage_defender = decide{set_target(long_defence_spot),
+const auto mage_defender = decide{set_target(long_defence_spot),
                                       last_resort_measures,
                                       attack_closest_threat_from_base,
                                       go_to_opponent_runner,
                                       attack_around_target{HERO_SIGHT_RANGE},
-                                      go_to_target};
+                                      patrol(long_defence_spot, short_defence_spot)};
 
 const auto default_comp = team_comp{mage_defender, home_defender, point_runner};
 
