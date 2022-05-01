@@ -934,7 +934,9 @@ struct hero_cache {
     hero_cache(hero_id hero) : hero_{hero}, ref{} {}
 
     void reset() { ref=nullptr; }
-    void set_ref(entity& e) { ref = addressof(e); }
+    void set_ref(entity &e) {
+      ref = addressof(e);
+    }
     position_t target;
 
     optional<position_t> next_patrol_point() {
@@ -952,11 +954,19 @@ struct hero_cache {
         return patrol.has_value() ? patrol->close_to_current_path(p, dist) : false;
     }
 
+    bool attacking() const { 
+        return attacking_;
+    }
+    void attack(bool attacking) {
+        attacking_ = attacking;
+    }
+
 
 private:
     hero_id hero_;
     entity* ref;
     optional<patrol_cache> patrol;
+    bool attacking_;
 };
 
 /** \brief contains everything related to the state of the game
@@ -1102,6 +1112,17 @@ public:
 
   bool on_patrol_path(hero_id id, position_t p, int dist) {
       return hero_cache_[id.value].on_patrol_path(p, dist);
+  }
+
+  bool flaged_as_attacking(hero_id id) const {
+      return hero_cache_[id.value].attacking();
+  }
+
+  void flag_as_attacking(hero_id id) { 
+      hero_cache_[id.value].attack(true);
+  }
+  void clear_attack_flag(hero_id id) {
+      hero_cache_[id.value].attack(false);
   }
 
   friend std::istream &operator>>(std::istream &in, game_state &state);
@@ -1281,6 +1302,24 @@ template<class ...Args>
 decision_group(Args&&...) -> decision_group<decay_t<Args>...>;
 
 // decision utilities
+enum class threat_factor_t {
+    ally = -1, 
+    neutral = 0,
+    threat = 1
+};
+threat_factor_t threat_factor(const entity& m) {
+  return m.threat_for(player::opponent) ? threat_factor_t::ally
+         : m.threat_for(player::me)     ? threat_factor_t::threat
+                                        : threat_factor_t::neutral;
+}
+
+constexpr bool operator>=(threat_factor_t left, threat_factor_t right) {
+    return static_cast<int>(left) >= static_cast<int>(right);
+}
+constexpr bool operator>(threat_factor_t left, threat_factor_t right) {
+    return static_cast<int>(left) > static_cast<int>(right);
+}
+
 optional<position_t> target_for_wind(const entity &hero,
                                      game_state& state) {
 
@@ -1396,21 +1435,26 @@ optional<entity> best_controllable_monster(const entity &hero, game_state& state
   return {};
 }
 
-optional<entity> shield_target(const entity& hero, const entity_list& monsters, position_t opponent_base) {
-    int best_distance = INFINITE_DISTANCE;
-    const entity* result = nullptr;
-    for (const auto& monster : monsters) {
-        if (!monster.threat_for(player::opponent) || distance(hero.position(), monster.position()) > SHIELD_RANGE) {
-            continue;
-        }
-        int dist_from_ob = distance(monster.position(), opponent_base);
-        if (dist_from_ob < best_distance && 
-            dist_from_ob < 12 * 400 + 300) { // 12 turn shield * 400 monster mvt + 300 dmg range
-          result = &monster;
-          best_distance = dist_from_ob;
-        }
+optional<entity> shield_target(const entity &hero, const entity_list &monsters,
+                               position_t opponent_base) {
+  int best_distance = INFINITE_DISTANCE;
+  const entity *result = nullptr;
+  for (const auto &monster : monsters) {
+    if (!monster.threat_for(player::opponent) ||
+        distance(hero.position(), monster.position()) > SHIELD_RANGE ||
+        monster.shielded()) {
+      continue;
     }
-    return result == nullptr ? nullopt : optional{*result};
+    int dist_from_ob = distance(monster.position(), opponent_base);
+    if (dist_from_ob < best_distance &&
+        dist_from_ob <
+            12 * 400 +
+                300) { // 12 turn shield * 400 monster mvt + 300 dmg range
+      result = &monster;
+      best_distance = dist_from_ob;
+    }
+  }
+  return result == nullptr ? nullopt : optional{*result};
 }
 
 /********************************/
@@ -1422,6 +1466,12 @@ optional<decision> wind_away_if_needed(hero_id id, game_state& state) {
 
   if (auto target_monster = target_for_wind(this_hero, state);
       target_monster.has_value()) {
+    auto op = state.opponent_runner();
+    bool threatening =
+        (op && within(op->get(), state.base, BASE_SIGHT_RANGE)) ||
+        within(target_monster.value(), state.base, DANGER_ZONE / 2);
+    if (!threatening)
+      return {};
     if (auto spell = state.reserve_mana<wind>(state.opponent_base); spell.has_value()) {
       return spell.value(); 
     }
@@ -1436,16 +1486,16 @@ optional<decision> shadow_opponent_runner(hero_id id, game_state& state) {
   const auto opponent_runner = state.opponent_runner();
   if (!opponent_runner) return {};
 
-  if (const auto spell = state.reserve_mana<shield>(this_hero.id());
-      spell.has_value() && state.opponent_mana() >= 10 &&
-      !this_hero.shielded() && threat.has_value()) {
-    return spell.value();
-  }
-  if (state.my_mana() >= 30 && !opponent_runner->shielded() &&
-      !opponent_runner->controlled() &&
-      distance(opponent_runner->position(), this_hero.position()) <
+  if (state.my_mana() >= 30 && !opponent_runner->get().shielded() &&
+      !opponent_runner->get().controlled() &&
+      distance(opponent_runner->get().position(), this_hero.position()) <
           CONTROL_RANGE) {
-    if (auto spell = state.reserve_mana<control>(opponent_runner->id(),
+    if (find_if(state.monsters.begin(), state.monsters.end(), [&](const auto& m) {
+        return within(m, opponent_runner->get(), CONTROL_RANGE);
+    }) == state.monsters.end()) {
+        return {};
+    }
+    if (auto spell = state.reserve_mana<control>(opponent_runner->get().id(),
                                                  state.opponent_base))
       return spell;
   }
@@ -1464,8 +1514,7 @@ constexpr auto patrol = [](auto &&...positions) {
   return [=](hero_id id, game_state &state) -> decision {
     static const auto patrol_p =
         patrol_cache{positions(id, state)...};
-        const auto  point =     state.patrol(id, patrol_p);
-    return walk{point};
+    return walk{state.patrol(id, patrol_p)};
   };
 };
 
@@ -1507,10 +1556,10 @@ constexpr auto middle_defence_spot = [] (hero_id, game_state& state) {
     return travel(state.base, state.middle, DEFENCE_RADIUS);
 };
 constexpr auto short_attack_spot = [] (hero_id, game_state& state) {
-    return travel(state.opponent_base, state.short_corner, OFFENSE_RADIUS);
+    return travel(travel(state.opponent_base, state.short_corner, OFFENSE_RADIUS), state.middle, HERO_SIGHT_RANGE);
 };
 constexpr auto long_attack_spot = [] (hero_id, game_state& state) {
-    return travel(state.opponent_base, state.long_corner, OFFENSE_RADIUS);
+    return travel(travel(state.opponent_base, state.long_corner, OFFENSE_RADIUS), state.middle, HERO_SIGHT_RANGE);
 };
 constexpr auto middle_attack_spot = [] (hero_id, game_state& state) {
     return travel(state.opponent_base, state.middle, OFFENSE_RADIUS);
@@ -1518,14 +1567,14 @@ constexpr auto middle_attack_spot = [] (hero_id, game_state& state) {
 
 optional<decision> shield_opponent_monster(hero_id id, game_state &state) {
   const auto this_hero = state.hero(id);
-  if (state.my_mana() > 50) {
-    if (auto monster =
-            shield_target(this_hero, state.monsters, state.opponent_base);
-        monster.has_value()) {
-      if (auto spell = state.reserve_mana<shield>(monster->id());
-          spell.has_value()) {
-        return spell.value();
-      }
+  if (auto monster =
+          shield_target(this_hero, state.monsters, state.opponent_base);
+      monster.has_value() &&
+      (state.my_mana() > 50 ||
+       within(*monster, state.opponent_base, DANGER_ZONE))) {
+    if (auto spell = state.reserve_mana<shield>(monster->id());
+        spell.has_value()) {
+      return spell.value();
     }
   }
   return {};
@@ -1571,6 +1620,29 @@ optional<decision> attack_closest_threat_from_self(hero_id id, game_state& state
   return {};
 }
 
+optional<decision> attack_closest_threat_from_self_around_opponent_base(hero_id id, game_state& state) {
+  const auto this_hero = state.hero(id);
+
+  const entity* best = nullptr;
+  float closest_distance_from_self = numeric_limits<float>::max();
+  auto best_threat = threat_factor_t::ally;
+
+  for (auto &m : state.monsters) {
+    if (within(m, state.opponent_base, DANGER_ZONE * 2)) {
+      auto tf = threat_factor(m);
+      auto d = distance(m.position(), this_hero.position());
+      if (tf > best_threat ||
+          (tf >= best_threat && d < closest_distance_from_self)) {
+        best = addressof(m);
+        closest_distance_from_self = d;
+        best_threat = tf;
+      }
+    }
+  }
+
+  return {};
+}
+
 optional<decision> last_resort_control(hero_id id, game_state& state) {
   const auto this_hero = state.hero(id);
   const auto threat = closest_threat(state.base, state.monsters, DANGER_ZONE * 1.2);
@@ -1579,6 +1651,11 @@ optional<decision> last_resort_control(hero_id id, game_state& state) {
       !threat->shielded() &&
       !within(this_hero, threat.value(), WIND_RANGE) && within(this_hero, threat.value(), CONTROL_RANGE) &&
       within(threat.value(), state.base, WIND_RANGE + 800)) {
+    for (auto& h : state.heroes) {
+        if (h.id() != this_hero.id() && within(h, *threat, WIND_RANGE)) {
+            return {};
+        }
+    }
     if (auto spell =
             state.reserve_mana<control>(threat->id(), state.opponent_base)) {
       return spell.value();
@@ -1611,7 +1688,7 @@ optional<decision> go_to_opponent_runner(hero_id id, game_state &state) {
   const auto opponent_runner = state.opponent_runner();
   if (opponent_runner.has_value()) {
     if (state.my_mana() > 10) {
-      return walk{opponent_runner.value()};
+      return walk{opponent_runner->get().position()};
     }
   }
   return {};
@@ -1649,16 +1726,60 @@ optional<decision> shield_ally(hero_id id, game_state &state) {
 
 optional<decision> wind_into_opponent_base(hero_id id, game_state& state) {
   const auto &this_hero = state.hero(id);
-  int count = count_if(
-      state.monsters.begin(), state.monsters.end(), [&](const entity &m) {
-        return !m.shielded() && within(m, this_hero, WIND_RANGE) &&
-               within(m, state.opponent_base, DANGER_ZONE + WIND_RANGE);
-      });
-  if (count) {
+  int hp_value = 0;
+  for (auto &m : state.monsters) {
+    if (!m.shielded() && within(m, this_hero, WIND_RANGE) &&
+        within(m, state.opponent_base, DANGER_ZONE + WIND_RANGE)) {
+      hp_value += m.health();
+    }
+  }
+  if (hp_value > 15) {
     auto spell = state.reserve_mana<wind>(state.opponent_base);
     if (spell.has_value()) {
+      state.flag_as_attacking(id);
       return spell;
     }
+  }
+  return {};
+}
+
+optional<decision> follow_up_wind(hero_id id, game_state &state) {
+  const auto &this_hero = state.hero(id);
+  if (!state.flaged_as_attacking(id)) {
+    return {};
+  }
+  state.clear_attack_flag(id);
+
+  const entity *closest_in_enemy_base = nullptr;
+  int best_health = -2;
+  float best_distance = numeric_limits<float>::max();
+  int support_needed_count = 0;
+
+  for (auto &monster : state.monsters) {
+    if (within(monster, state.opponent_base, DANGER_ZONE) &&
+        !monster.shielded()) {
+      support_needed_count++;
+      auto d = distance(monster.position(), state.opponent_base);
+      auto h = monster.health();
+      if (h > best_health || (h == best_health && d < best_distance)) {
+        best_health = h;
+        best_distance = d;
+        closest_in_enemy_base = addressof(monster);
+      }
+    }
+  }
+
+  if (closest_in_enemy_base != nullptr) {
+    if (support_needed_count >= 2) {
+      state.flag_as_attacking(id);
+    }
+    auto spell = state.reserve_mana<shield>(closest_in_enemy_base->id());
+    if (spell.has_value()) {
+        return spell;
+    }
+
+  } else {
+    return walk{state.opponent_base};
   }
   return {};
 }
@@ -1667,17 +1788,15 @@ optional<decision> attack_around_patrol_path(hero_id id, game_state& state) {
     const auto& this_hero = state.hero(id);
     const entity* target = nullptr;
     int best_distance = numeric_limits<int>::max();
-    bool best_threat = -1;
+    threat_factor_t best_threat = threat_factor_t::ally;
     for (const entity& m : state.monsters) {
-      int threat_factor = m.threat_for(player::opponent) ? -1
-                          : m.threat_for(player::me)     ? 1
-                                                         : 0;
+      auto tf = threat_factor(m);;
       float dist = distance(this_hero.position(), m.position());
       bool is_on_patrol_path = state.on_patrol_path(id, m.position(), HERO_SIGHT_RANGE);
-      if (is_on_patrol_path && (threat_factor > best_threat ||
-          (threat_factor >= best_threat && dist < best_distance))) {
+      if (is_on_patrol_path && (tf > best_threat ||
+          (tf >= best_threat && dist < best_distance))) {
         best_distance = dist;
-        best_threat = threat_factor;
+        best_threat = tf;
         target = addressof(m);
       }
     }
@@ -1705,16 +1824,18 @@ constexpr auto point_runner =
     decide{set_target(close_to_opponent_base),
            shield_opponent_monster,
            wind_into_opponent_base,
+           follow_up_wind,
            control_monster_to_attack,
            attack_around_patrol_path,
+           attack_closest_threat_from_self_around_opponent_base,
            patrol(middle_attack_spot, short_attack_spot, middle_attack_spot,
                   long_attack_spot)};
 
 const auto mage_defender = decide{set_target(long_defence_spot),
                                       last_resort_measures,
                                       attack_closest_threat_from_base,
-                                      go_to_opponent_runner,
                                       attack_around_patrol_path,
+                                      go_to_opponent_runner,
                                       patrol(long_defence_spot, middle_defence_spot)};
 
 const auto default_comp = team_comp{mage_defender, home_defender, point_runner};
