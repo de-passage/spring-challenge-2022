@@ -1075,14 +1075,14 @@ public:
       hero_cache_[heroes_.size() - 1].set_ref(heroes_.back());
   }
 
-  optional<position_t> opponent_runner() {
+  entity_ref_opt opponent_runner() {
     if (cache_.opponent_runner.has_value())
-      return cache_.opponent_runner->get().position();
+      return cache_.opponent_runner;
 
     for (auto& op : opponents_) {
         if (closest_to{op}(base, opponent_base)) {
             cache_.opponent_runner = op;
-            return op.position();
+            return cache_.opponent_runner;
         }
     }
     return {};
@@ -1433,29 +1433,26 @@ optional<decision> shadow_opponent_runner(hero_id id, game_state& state) {
   const auto threat = closest_threat(state.base, state.monsters);
   const auto this_hero = state.hero(id);
   const position_t target = state.target_of(id);
-  const auto opponent_runner = find_if(
-      state.opponents.begin(), state.opponents.end(), [&](const entity &ent) {
-        return within(ent, state.base, DANGER_ZONE * 1.1);
-      });
+  const auto opponent_runner = state.opponent_runner();
+  if (!opponent_runner) return {};
 
-  if (opponent_runner != state.opponents.end()) {
-    if (const auto spell = state.reserve_mana<shield>(this_hero.id());
-        spell.has_value() && state.opponent_mana() >= 10 &&
-        !this_hero.shielded() && threat.has_value()) {
-      return spell.value();
-    }
-    if (state.my_mana() >= 30 && !opponent_runner->shielded() &&
-        !opponent_runner->controlled() &&
-        distance(opponent_runner->position(), this_hero.position()) <
-            CONTROL_RANGE) {
-        if (auto spell = state.reserve_mana<control>(opponent_runner->id(), state.opponent_base))
+  if (const auto spell = state.reserve_mana<shield>(this_hero.id());
+      spell.has_value() && state.opponent_mana() >= 10 &&
+      !this_hero.shielded() && threat.has_value()) {
+    return spell.value();
+  }
+  if (state.my_mana() >= 30 && !opponent_runner->shielded() &&
+      !opponent_runner->controlled() &&
+      distance(opponent_runner->position(), this_hero.position()) <
+          CONTROL_RANGE) {
+    if (auto spell = state.reserve_mana<control>(opponent_runner->id(),
+                                                 state.opponent_base))
       return spell;
-    }
   }
   return {};
 }
 
-optional<decision> attack_closest_threat_from_base(hero_id, game_state& state) {
+optional<decision> attack_closest_threat_from_base(hero_id id, game_state& state) {
   const auto threat = closest_threat(state.base, state.monsters);
   if (threat.has_value()) {
     return walk{threat->position()};
@@ -1467,7 +1464,8 @@ constexpr auto patrol = [](auto &&...positions) {
   return [=](hero_id id, game_state &state) -> decision {
     static const auto patrol_p =
         patrol_cache{positions(id, state)...};
-    return walk{state.patrol(id, patrol_p)};
+        const auto  point =     state.patrol(id, patrol_p);
+    return walk{point};
   };
 };
 
@@ -1525,8 +1523,9 @@ optional<decision> shield_opponent_monster(hero_id id, game_state &state) {
             shield_target(this_hero, state.monsters, state.opponent_base);
         monster.has_value()) {
       if (auto spell = state.reserve_mana<shield>(monster->id());
-          spell.has_value())
+          spell.has_value()) {
         return spell.value();
+      }
     }
   }
   return {};
@@ -1538,8 +1537,9 @@ optional<decision> control_monster_to_attack(hero_id id, game_state& state) {
     if (auto closest = best_controllable_monster(this_hero, state);
         closest.has_value()) {
       if (auto spell =
-              state.reserve_mana<control>(closest->id(), state.opponent_base))
+              state.reserve_mana<control>(closest->id(), state.opponent_base)) {
         return spell;
+      }
     }
   }
   return {};
@@ -1610,8 +1610,9 @@ optional<decision> shield_self(hero_id id, game_state& state) {
 optional<decision> go_to_opponent_runner(hero_id id, game_state &state) {
   const auto opponent_runner = state.opponent_runner();
   if (opponent_runner.has_value()) {
-    if (state.my_mana() > 10)
+    if (state.my_mana() > 10) {
       return walk{opponent_runner.value()};
+    }
   }
   return {};
 }
@@ -1655,8 +1656,9 @@ optional<decision> wind_into_opponent_base(hero_id id, game_state& state) {
       });
   if (count) {
     auto spell = state.reserve_mana<wind>(state.opponent_base);
-    if (spell.has_value())
+    if (spell.has_value()) {
       return spell;
+    }
   }
   return {};
 }
@@ -1672,9 +1674,8 @@ optional<decision> attack_around_patrol_path(hero_id id, game_state& state) {
                                                          : 0;
       float dist = distance(this_hero.position(), m.position());
       bool is_on_patrol_path = state.on_patrol_path(id, m.position(), HERO_SIGHT_RANGE);
-
-      if (is_on_patrol_path && threat_factor > best_threat ||
-          (threat_factor >= best_threat && dist < best_distance)) {
+      if (is_on_patrol_path && (threat_factor > best_threat ||
+          (threat_factor >= best_threat && dist < best_distance))) {
         best_distance = dist;
         best_threat = threat_factor;
         target = addressof(m);
